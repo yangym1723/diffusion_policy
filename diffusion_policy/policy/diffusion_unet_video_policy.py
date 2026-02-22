@@ -7,6 +7,7 @@ from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.model.common.history_action_encoder import HistoryActionEncoder
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
@@ -34,6 +35,8 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
             n_blocks_per_level=1,
             ta_kernel_size=3,
             ta_n_groups=8,
+            use_history_encoder=False,
+            history_encoder_hidden_dim=128,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -126,11 +129,45 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.lowdim_as_global_cond = lowdim_as_global_cond
+        self.use_history_encoder = use_history_encoder
         self.kwargs = kwargs
+        self.history_encoder = None
+        if self.use_history_encoder:
+            self.history_encoder = HistoryActionEncoder(
+                action_dim=action_dim,
+                output_dim=lowdim_input_dim,
+                hidden_dim=history_encoder_hidden_dim
+            )
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+    def _shifted_prefix_sum(self, action_seq: torch.Tensor) -> torch.Tensor:
+        prefix = torch.cumsum(action_seq, dim=1)
+        zero = torch.zeros_like(prefix[:, :1])
+        return torch.cat([zero, prefix[:, :-1]], dim=1)
+
+    def _prefix_sum(self, action_seq: torch.Tensor) -> torch.Tensor:
+        return torch.cumsum(action_seq, dim=1)
+
+    def _align_steps(self, x: torch.Tensor, target_steps: int) -> torch.Tensor:
+        bsz, steps, dim = x.shape
+        if steps == target_steps:
+            return x
+        if steps > target_steps:
+            return x[:, -target_steps:]
+        pad = torch.zeros(
+            size=(bsz, target_steps - steps, dim),
+            device=x.device,
+            dtype=x.dtype
+        )
+        return torch.cat([pad, x], dim=1)
+
+    def _encode_history(self, action_seq: torch.Tensor, target_steps: int, shifted: bool) -> torch.Tensor:
+        history = self._shifted_prefix_sum(action_seq) if shifted else self._prefix_sum(action_seq)
+        history = self._align_steps(history, target_steps)
+        return self.history_encoder(history)
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -178,9 +215,9 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
         obs_dict: must include "obs" key
         result: must include "action" key
         """
-        assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
-        nobs = self.normalizer.normalize(obs_dict)
+        obs_input = {k: v for k, v in obs_dict.items() if k != 'past_action'}
+        nobs = self.normalizer.normalize(obs_input)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -199,6 +236,12 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
         rgb_feature = torch.cat(list(rgb_features_map.values()), dim=-1)
 
         lowdim_input = torch.cat([nobs[k] for k in self.lowdim_keys], dim=-1)
+        if self.use_history_encoder:
+            history_feat = torch.zeros_like(lowdim_input)
+            if ('past_action' in obs_dict) and (obs_dict['past_action'] is not None):
+                npast_action = self.normalizer['action'].normalize(obs_dict['past_action'])
+                history_feat = self._encode_history(npast_action, lowdim_input.shape[1], shifted=False)
+            lowdim_input = lowdim_input + history_feat
 
         # handle different ways of passing lowdim
         global_cond = None
@@ -258,6 +301,9 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
         rgb_feature = torch.cat(list(rgb_features_map.values()), dim=-1)
 
         lowdim_input = torch.cat([nobs[k] for k in self.lowdim_keys], axis=-1)
+        if self.use_history_encoder:
+            lowdim_input = lowdim_input + self._encode_history(
+                nactions, lowdim_input.shape[1], shifted=True)
         
         # handle different ways of passing lowdim
         global_cond = None

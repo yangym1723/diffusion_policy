@@ -14,7 +14,7 @@ n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
-past_action_visible: False
+past_action_visible: True
 keypoint_visible_rate: 1.0
 obs_as_global_cond: True
 
@@ -47,6 +47,9 @@ policy:
   cond_predict_scale: True
   obs_encoder_group_norm: True
   eval_fixed_crop: True
+
+  use_history_encoder: True
+  history_encoder_hidden_dim: 128
 
   # scheduler.step params
   # predict_epsilon: True
@@ -135,3 +138,4 @@ hydra:
   sweep:
     dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
     subdir: ${hydra.job.num}
+

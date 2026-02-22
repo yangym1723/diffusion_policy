@@ -6,6 +6,7 @@ from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.model.common.history_action_encoder import HistoryActionEncoder
 from diffusion_policy.policy.base_lowdim_policy import BaseLowdimPolicy
 from diffusion_policy.model.diffusion.transformer_for_diffusion import TransformerForDiffusion
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
@@ -22,6 +23,8 @@ class DiffusionTransformerLowdimPolicy(BaseLowdimPolicy):
             num_inference_steps=None,
             obs_as_cond=False,
             pred_action_steps_only=False,
+            use_history_encoder=False,
+            history_encoder_hidden_dim=128,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -45,11 +48,45 @@ class DiffusionTransformerLowdimPolicy(BaseLowdimPolicy):
         self.n_obs_steps = n_obs_steps
         self.obs_as_cond = obs_as_cond
         self.pred_action_steps_only = pred_action_steps_only
+        self.use_history_encoder = use_history_encoder
         self.kwargs = kwargs
+        self.history_encoder = None
+        if self.use_history_encoder:
+            self.history_encoder = HistoryActionEncoder(
+                action_dim=action_dim,
+                output_dim=obs_dim,
+                hidden_dim=history_encoder_hidden_dim
+            )
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+    def _shifted_prefix_sum(self, action_seq: torch.Tensor) -> torch.Tensor:
+        prefix = torch.cumsum(action_seq, dim=1)
+        zero = torch.zeros_like(prefix[:, :1])
+        return torch.cat([zero, prefix[:, :-1]], dim=1)
+
+    def _prefix_sum(self, action_seq: torch.Tensor) -> torch.Tensor:
+        return torch.cumsum(action_seq, dim=1)
+
+    def _align_steps(self, x: torch.Tensor, target_steps: int) -> torch.Tensor:
+        bsz, steps, dim = x.shape
+        if steps == target_steps:
+            return x
+        if steps > target_steps:
+            return x[:, -target_steps:]
+        pad = torch.zeros(
+            size=(bsz, target_steps - steps, dim),
+            device=x.device,
+            dtype=x.dtype
+        )
+        return torch.cat([pad, x], dim=1)
+
+    def _encode_history(self, action_seq: torch.Tensor, target_steps: int, shifted: bool) -> torch.Tensor:
+        history = self._shifted_prefix_sum(action_seq) if shifted else self._prefix_sum(action_seq)
+        history = self._align_steps(history, target_steps)
+        return self.history_encoder(history)
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -97,13 +134,19 @@ class DiffusionTransformerLowdimPolicy(BaseLowdimPolicy):
         """
 
         assert 'obs' in obs_dict
-        assert 'past_action' not in obs_dict # not implemented yet
         nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
         B, _, Do = nobs.shape
         To = self.n_obs_steps
         assert Do == self.obs_dim
         T = self.horizon
         Da = self.action_dim
+        if self.use_history_encoder:
+            history_feat = torch.zeros((B, To, Do), device=nobs.device, dtype=nobs.dtype)
+            if ('past_action' in obs_dict) and (obs_dict['past_action'] is not None):
+                npast_action = self.normalizer['action'].normalize(obs_dict['past_action'])
+                history_feat = self._encode_history(npast_action, To, shifted=False)
+            nobs = nobs.clone()
+            nobs[:, :To] = nobs[:, :To] + history_feat
 
         # build input
         device = self.device
@@ -177,6 +220,8 @@ class DiffusionTransformerLowdimPolicy(BaseLowdimPolicy):
         nbatch = self.normalizer.normalize(batch)
         obs = nbatch['obs']
         action = nbatch['action']
+        if self.use_history_encoder:
+            obs = obs + self._encode_history(action, obs.shape[1], shifted=True)
 
         # handle different ways of passing observation
         cond = None

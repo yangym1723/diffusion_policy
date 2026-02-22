@@ -7,6 +7,7 @@ from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
+from diffusion_policy.model.common.history_action_encoder import HistoryActionEncoder
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.model.diffusion.conditional_unet1d import ConditionalUnet1D
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
@@ -36,6 +37,8 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             cond_predict_scale=True,
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
+            use_history_encoder=False,
+            history_encoder_hidden_dim=128,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -162,7 +165,15 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
+        self.use_history_encoder = use_history_encoder
         self.kwargs = kwargs
+        self.history_encoder = None
+        if self.use_history_encoder:
+            self.history_encoder = HistoryActionEncoder(
+                action_dim=action_dim,
+                output_dim=obs_feature_dim,
+                hidden_dim=history_encoder_hidden_dim
+            )
 
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
@@ -170,6 +181,32 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
 
         print("Diffusion params: %e" % sum(p.numel() for p in self.model.parameters()))
         print("Vision params: %e" % sum(p.numel() for p in self.obs_encoder.parameters()))
+
+    def _shifted_prefix_sum(self, action_seq: torch.Tensor) -> torch.Tensor:
+        prefix = torch.cumsum(action_seq, dim=1)
+        zero = torch.zeros_like(prefix[:, :1])
+        return torch.cat([zero, prefix[:, :-1]], dim=1)
+
+    def _prefix_sum(self, action_seq: torch.Tensor) -> torch.Tensor:
+        return torch.cumsum(action_seq, dim=1)
+
+    def _align_steps(self, x: torch.Tensor, target_steps: int) -> torch.Tensor:
+        bsz, steps, dim = x.shape
+        if steps == target_steps:
+            return x
+        if steps > target_steps:
+            return x[:, -target_steps:]
+        pad = torch.zeros(
+            size=(bsz, target_steps - steps, dim),
+            device=x.device,
+            dtype=x.dtype
+        )
+        return torch.cat([pad, x], dim=1)
+
+    def _encode_history(self, action_seq: torch.Tensor, target_steps: int, shifted: bool) -> torch.Tensor:
+        history = self._shifted_prefix_sum(action_seq) if shifted else self._prefix_sum(action_seq)
+        history = self._align_steps(history, target_steps)
+        return self.history_encoder(history)
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -217,9 +254,9 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         obs_dict: must include "obs" key
         result: must include "action" key
         """
-        assert 'past_action' not in obs_dict # not implemented yet
         # normalize input
-        nobs = self.normalizer.normalize(obs_dict)
+        obs_input = {k: v for k, v in obs_dict.items() if k != 'past_action'}
+        nobs = self.normalizer.normalize(obs_input)
         value = next(iter(nobs.values()))
         B, To = value.shape[:2]
         T = self.horizon
@@ -238,7 +275,13 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             # condition through global feature
             this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, Do
+            nobs_features = nobs_features.reshape(B, To, -1)
+            if self.use_history_encoder:
+                history_feat = torch.zeros((B, To, Do), device=nobs_features.device, dtype=nobs_features.dtype)
+                if ('past_action' in obs_dict) and (obs_dict['past_action'] is not None):
+                    npast_action = self.normalizer['action'].normalize(obs_dict['past_action'])
+                    history_feat = self._encode_history(npast_action, To, shifted=False)
+                nobs_features = nobs_features + history_feat
             global_cond = nobs_features.reshape(B, -1)
             # empty data for action
             cond_data = torch.zeros(size=(B, T, Da), device=device, dtype=dtype)
@@ -249,6 +292,12 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, To, Do
             nobs_features = nobs_features.reshape(B, To, -1)
+            if self.use_history_encoder:
+                history_feat = torch.zeros((B, To, Do), device=nobs_features.device, dtype=nobs_features.dtype)
+                if ('past_action' in obs_dict) and (obs_dict['past_action'] is not None):
+                    npast_action = self.normalizer['action'].normalize(obs_dict['past_action'])
+                    history_feat = self._encode_history(npast_action, To, shifted=False)
+                nobs_features = nobs_features + history_feat
             cond_data = torch.zeros(size=(B, T, Da+Do), device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
             cond_data[:,:To,Da:] = nobs_features
@@ -299,7 +348,10 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             this_nobs = dict_apply(nobs, 
                 lambda x: x[:,:self.n_obs_steps,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, Do
+            nobs_features = nobs_features.reshape(batch_size, self.n_obs_steps, -1)
+            if self.use_history_encoder:
+                nobs_features = nobs_features + self._encode_history(
+                    nactions[:, :self.n_obs_steps], self.n_obs_steps, shifted=True)
             global_cond = nobs_features.reshape(batch_size, -1)
         else:
             # reshape B, T, ... to B*T
@@ -307,6 +359,9 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
+            if self.use_history_encoder:
+                nobs_features = nobs_features + self._encode_history(
+                    nactions, horizon, shifted=True)
             cond_data = torch.cat([nactions, nobs_features], dim=-1)
             trajectory = cond_data.detach()
 
